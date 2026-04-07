@@ -23,14 +23,34 @@ feedback.xlsx（PM质量信号）
       ↓
 改进目标 skill 文件（每次一个方向）
       ↓
-git commit → 用 patterns 代理评估新版本
+git commit → python scripts/skill_loop.py eval <skill> → 读取 skill_score
       ↓
-改善 → 保留；退化 → git reset 回滚
+改善 → 保留；退化 → git reset --hard HEAD~1
       ↓
 循环，直到收敛
 ```
 
-**skill_loop.py 只负责 git 状态管理**，分析和改进全由 Claude 完成。
+**Claude 自己就是 loop 的执行者**，用 Bash 工具直接操作 git 和调用 eval。
+`skill_loop.py eval` 只负责打分并退出，循环控制完全在 Claude 手里。
+
+---
+
+## ⚠️ 自主运行指令（最重要）
+
+**一旦迭代循环开始，绝对不要停下来询问用户是否继续。**
+不要问"要继续吗？"、"这轮改得对吗？"、"需要我停下来吗？"
+
+用户可能在睡觉。循环一直跑，直到以下任一条件满足：
+- 连续 5 轮 skill_score 无改善（收敛）
+- skill_score ≥ 8.5（达标）
+- 达到最大轮次（默认 20 轮）
+- 用户主动中断（Ctrl+C）
+
+如果某一轮没有好的改进思路，**不要停，要想更多**：
+- 重读 feedback.xlsx 的备注列，找新的 pattern
+- 重读目标 skill 的所有文件，找更深层的问题
+- 尝试更激进的方向（重写某个章节，而不是小改）
+- 尝试把之前"接近有效"的改动组合起来
 
 ---
 
@@ -82,7 +102,7 @@ Top patterns：
 
 ---
 
-### 第三步：确定目标 skill
+### 第三步：确定目标 skill，然后立即开始循环，不要等确认
 
 按以下顺序搜索目标 skill：
 1. `~/.claude/skills/{name}/`
@@ -97,35 +117,36 @@ Top patterns：
 
 ---
 
-### 第四步：迭代循环
+### 第四步：迭代循环（Claude 自主执行，不等用户确认）
 
-每一轮：
+每一轮的 Bash 操作序列：
 
-**1. 确定本轮改哪里**
+```bash
+# 1. 修改 skill 文件（用 Edit 工具，只改一个方向）
 
-根据 bad case patterns 和当前得分选择改进方向：
-```
-pattern 覆盖率最高的问题 → 优先改
-同分时 → 改最容易验证的
-已改过的方向没效果 → 换下一个 pattern
-```
+# 2. 提交
+git add <skill目录>
+git commit -m "skill-iter N: <改动描述>"
 
-**2. 修改 skill 文件**（只改一个方向）
+# 3. 评估（读取 skill_score 行）
+python scripts/skill_loop.py eval <skill名称> --feedback <feedback.xlsx路径>
+# 输出示例：skill_score: 7.4
 
-**3. skill_loop.py 接管**：
-```
-git commit 变更
-      ↓
-代理评估：新版 skill 能覆盖多少 bad case patterns？
-（LLM 判断：改动是否针对性地解决了归因的问题）
-      ↓
-得分提升 → ✅ 保留 commit
-得分持平/下降 → ❌ git reset 回滚，换方向
-      ↓
-追加写入 results.tsv
+# 4. 决策
+# skill_score 提升 → 继续下一轮
+# skill_score 持平/下降 → 回滚
+git reset --hard HEAD~1
+
+# 5. 不询问，直接进入第 N+1 轮
 ```
 
-**4. 进入下一轮**
+**改进方向选择优先级：**
+```
+pattern 出现频率最高 → 优先改
+已改过无效的方向   → 跳过，换下一个 pattern
+连续 2 轮同方向无效 → 尝试更激进的改法（重写章节）
+所有 pattern 都试过 → 重读 feedback 备注列，找新角度
+```
 
 ---
 
