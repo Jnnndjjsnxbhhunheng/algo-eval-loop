@@ -16,12 +16,34 @@ description: >
 ## 核心理念（对标 karpathy/autoresearch）
 
 ```
-autoresearch:  修改 train.py → python train.py → 读 val_bpb → 保留/回滚
-本 skill:      修改 skill   → 跑真实 pipeline → 对比输出  → 保留/回滚
+autoresearch:  修改 train.py → python train.py（跑全部训练数据）→ 读 val_bpb → 保留/回滚
+本 skill:      修改 skill   → 跑全部 bad cases → 算总分            → 保留/回滚
 ```
 
-**Claude 是执行者**：读目标 skill → 用 MCP 工具跑真实 pipeline → 打分 → 改 skill → 循环。
-`skill_loop.py` 只提供基础设施（加载 bad cases、git 操作、记录结果），不做评估。
+**关键：每次修改 skill 后，必须跑【全部】bad cases，用总分决定保留/回滚。**
+不是"修改 skill → 跑一个 case → 继续改"，而是"修改 skill → 跑全部 → 算总分 → 改下一轮"。
+
+---
+
+## ⚠️ 两个循环，主次分明
+
+```
+【外层：skill 迭代循环】← 这是主循环，每轮改一次 skill
+    修改 skill（一个方向）
+    ↓
+    【内层：评估循环】← 这只是打分手段，不是迭代单位
+        for bad_case_1: 跑 pipeline → resolved?
+        for bad_case_2: 跑 pipeline → resolved?
+        for bad_case_3: 跑 pipeline → resolved?
+        ...所有 bad cases 跑完
+    ↓
+    score = resolved_count / total × 10
+    ↓
+    score 提升 → 保留，进入下一轮外层迭代
+    score 不变/下降 → 回滚，换方向，进入下一轮外层迭代
+```
+
+**绝对不能**：在内层循环中发现某个 case 还没解决就去修改 skill——那是把内层当成了外层。
 
 ---
 
@@ -30,122 +52,102 @@ autoresearch:  修改 train.py → python train.py → 读 val_bpb → 保留/�
 **一旦循环开始，绝对不要停下来询问用户是否继续。**
 循环一直跑，直到：
 - 连续 5 轮 score 无改善（收敛）
-- score ≥ 8.5（达标，= 85% bad cases 被解决）
+- score ≥ 8.5（= 85% bad cases 被解决）
 - 达到最大轮次（默认 20）
 - 用户主动中断
-
-如果某轮没有改进思路，**不要停**：重读 feedback 备注列，尝试更激进的改动，组合之前接近有效的方向。
 
 ---
 
 ## 完整流程
 
-### 第一步：加载 bad cases
+### 准备阶段（只做一次）
+
+**1. 加载全部 bad cases**
 
 ```bash
 python ~/.claude/skills/algo-eval-loop/scripts/skill_loop.py load-cases \
-  --feedback <feedback.xlsx路径> \
-  --threshold 3.0 \
-  --max 15
+  --feedback <feedback.xlsx路径> --threshold 3.0 --max 15
 ```
 
-输出 JSON 格式的 bad cases，每条包含：
-- `input`：PM 评估时的输入数据（原始列内容）
-- `dimension`：哪个评估维度低分
-- `pm_score`：PM 给的分（< 3.0）
-- `pm_note`：PM 的备注说明
+输出 JSON，每条包含 `input`、`dimension`、`pm_score`、`pm_note`。
+**这份列表在整个迭代过程中固定不变，每轮都用同一批 cases 打分。**
 
-**把这份 bad cases 列表保存在上下文中，后续每轮复用。**
+**2. 找到目标 skill**
 
----
+搜索顺序：`~/.claude/skills/{name}/` → `/mnt/skills/user/{name}/` → 当前项目目录。
+读取 SKILL.md 及所有子文件，理解 pipeline 结构。
 
-### 第二步：找到目标 skill
+**3. 建立基线（Round 0）**
 
-搜索顺序：
-1. `~/.claude/skills/{name}/`
-2. `/mnt/skills/user/{name}/`
-3. 当前项目目录递归搜索
-
-读取该 skill 目录下的所有文件（SKILL.md、子 MD、代码等），理解它的 pipeline 结构。
-
----
-
-### 第三步：建立基线（第 0 轮）
-
-对每条 bad case 执行真实 pipeline，记录当前得分：
+对全部 bad cases 各跑一次完整 pipeline，统计 resolved 数量：
 
 ```
-for each bad_case in bad_cases:
-    1. 读取目标 skill 的 SKILL.md，理解 pipeline 各阶段
-    2. 用 bad_case["input"] 作为输入，按 skill 指令执行完整 pipeline
-       （调用目标 skill 需要的 MCP 工具、Bash 命令等）
-    3. 收集 pipeline 输出结果
-    4. 对比 PM 期望（bad_case["pm_note"] 描述了问题所在）
-    5. 判断：当前输出是否解决了 PM 指出的问题？→ resolved: true/false
+results = []
+for each bad_case in bad_cases:          ← 内层：评估用，跑完所有，不在这里改 skill
+    output = 按目标 skill 指令执行完整 pipeline(bad_case["input"])
+    resolved = 输出是否解决了 bad_case["pm_note"] 指出的问题？
+    results.append(resolved)
 
-baseline_score = resolved_count / total_bad_cases * 10
+baseline_score = sum(results) / len(results) * 10
 ```
 
-记录基线：
 ```bash
-python skill_loop.py log --tsv results.tsv --round 0 \
-  --score <baseline_score> --decision baseline
+python skill_loop.py log --tsv results.tsv --round 0 --score <baseline_score> --decision baseline
 ```
 
 ---
 
-### 第四步：迭代循环（不停止，直到收敛）
+### 迭代阶段（外层循环，不停止）
 
-每一轮：
+**每一轮的顺序必须是：先改 skill → 再跑全部 cases → 再决定保留/回滚。**
 
-**1. 分析本轮改哪里**
+#### Step 1：分析改哪里
 
-从上一轮 unresolved cases 中找共性：
-- 哪类输入在 pipeline 哪个阶段出了问题？
-- 是 skill 的哪条指令（或缺失的指令）导致的？
-- 本轮选择覆盖最多 unresolved cases 的方向
+看上一轮哪些 cases 还是 unresolved，找共性：
+- 多个 unresolved cases 在 pipeline 哪个阶段失败？
+- 对应 skill 的哪条指令缺失或有误？
+- 本轮选择能覆盖最多 unresolved cases 的改动方向
 
-**2. 修改 skill 文件**（只改一个方向）
+#### Step 2：修改 skill（只改一个方向）
 
-**3. Commit**
+#### Step 3：Commit
+
 ```bash
-python skill_loop.py commit <skill目录> --message "skill-iter N: <改动描述>"
+python skill_loop.py commit <skill目录> -m "skill-iter N: <改动描述>"
 ```
 
-**4. 重跑 bad cases，计算新得分**
+#### Step 4：评估（内层循环，跑完全部，不在这里改 skill）
 
 ```
-for each bad_case in bad_cases:
-    按更新后的 skill 指令重新执行 pipeline
-    → resolved: true/false
+results = []
+for each bad_case in bad_cases:          ← 注意：跑完全部再统计，不要边跑边改
+    output = 按更新后的 skill 执行完整 pipeline(bad_case["input"])
+    resolved = 输出是否解决了 pm_note 的问题？
+    results.append(resolved)
 
-new_score = resolved_count / total_bad_cases * 10
+new_score = sum(results) / len(results) * 10
 ```
 
-**5. 保留或回滚**
+#### Step 5：保留或回滚
+
 ```bash
-# 改善 → 保留，记录
-python skill_loop.py log --tsv results.tsv --round N \
-  --score <new_score> --decision advance --hash <commit_hash>
+# new_score > 上轮 score → 保留
+python skill_loop.py log --tsv results.tsv --round N --score <new_score> --decision advance --hash <hash>
 
-# 未改善 → 回滚，记录
+# new_score ≤ 上轮 score → 回滚
 python skill_loop.py revert
-python skill_loop.py log --tsv results.tsv --round N \
-  --score <new_score> --decision revert
+python skill_loop.py log --tsv results.tsv --round N --score <new_score> --decision revert
 ```
 
-**6. 直接进入下一轮，不询问用户**
+#### Step 6：直接进入下一轮，不询问用户
 
 ---
 
 ## Pipeline 执行要点
 
-对 bad case 执行 pipeline 时：
-
-- **严格按目标 skill 的指令执行**，不要跳步骤
+- **严格按目标 skill 的指令执行全部阶段**，不要跳步骤
 - **使用目标 skill 需要的 MCP 工具**（如 search_notes、extract_entities 等）
-- **记录每个阶段的中间输出**，方便定位问题出在哪一步
-- **判断 resolved 时对比 PM 的 pm_note**，不是泛泛评价输出质量
+- **判断 resolved 时只看 pm_note**：PM 说"缺少主流品牌"，就看输出里有没有主流品牌
 
 ---
 
@@ -153,21 +155,6 @@ python skill_loop.py log --tsv results.tsv --round N \
 
 ```
 eval-workspace/
-├── versions/
-│   └── vN/
-│       └── feedback.xlsx       # PM 评估反馈（输入）
 └── {skill-name}/
-    └── results_YYYYMMDD.tsv    # 每轮迭代记录
+    └── results_YYYYMMDD.tsv    # 每轮迭代记录（round/score/decision/hash）
 ```
-
----
-
-## 关键原则
-
-**评估 = 跑真实 pipeline**：不是看 skill 文字写得好不好，而是用 bad case 输入真正执行，看输出是否解决了 PM 的问题。
-
-**每次只改一个方向**：小步迭代，改完立刻测试，退化就回滚。
-
-**score = resolved / total × 10**：直接对应"解决了多少 PM 反馈的问题"。
-
-**不要假设入口**：如果缺少 feedback.xlsx 或 skill 名称，直接问用户。
