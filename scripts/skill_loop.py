@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-skill_loop.py — Skill 迭代 harness
+skill_loop.py — 基于 feedback.xlsx 语义评估的 Skill 迭代 harness
+
+评估逻辑（语义而非关键词）：
+  1. 从 feedback.xlsx 提取低分 bad cases（含输入数据 + PM 备注）
+  2. LLM 判断：当前 skill 指令，能否解决这些具体 case？
+  3. 分数 = 被解决的 bad case 比例 × 10
 
 两种使用方式：
+  eval 模式（Claude 自主循环时调用，只打分退出）：
+    python scripts/skill_loop.py eval <skill名称> --feedback feedback.xlsx
 
-1. eval 模式（Claude 自主循环时调用）：
-   python scripts/skill_loop.py eval <skill名称> [--feedback feedback.xlsx]
-   → 评估当前 skill 质量，输出 skill_score: X.X，退出
-
-2. run 模式（有人监督时使用）：
-   python scripts/skill_loop.py run <skill名称> [--feedback feedback.xlsx] [--rounds 20]
-   → 交互式循环，每轮等待用户确认
-
-Claude 自主整夜运行时只用 eval 模式，循环逻辑由 Claude 通过 Bash 工具实现。
+  run 模式（有人监督的交互循环）：
+    python scripts/skill_loop.py run <skill名称> --feedback feedback.xlsx [--rounds 20]
 """
 
 import argparse
@@ -48,6 +48,16 @@ def find_skill_dir(name: str) -> Path | None:
     return None
 
 
+def collect_skill_text(skill_dir: Path) -> str:
+    """收集 skill 目录下所有相关文本文件内容。"""
+    parts = []
+    for f in sorted(skill_dir.rglob("*")):
+        if f.suffix in (".md", ".py", ".ts", ".txt", ".json") and f.stat().st_size < 30000:
+            rel = f.relative_to(skill_dir)
+            parts.append(f"### {rel}\n{f.read_text(encoding='utf-8', errors='replace')}")
+    return "\n\n".join(parts)
+
+
 # ── Git ───────────────────────────────────────────────────────────────────────
 
 def git(*args: str, cwd: Path) -> str:
@@ -78,103 +88,172 @@ def find_repo_root(path: Path) -> Path:
     return path
 
 
-# ── Patterns 加载 ─────────────────────────────────────────────────────────────
+# ── feedback.xlsx 解析 ────────────────────────────────────────────────────────
 
-def load_patterns(skill_dir: Path, feedback_path: Path | None) -> list[dict]:
-    for p in [
-        skill_dir / "patterns.json",
-        (feedback_path.parent / "patterns.json") if feedback_path else None,
-    ]:
-        if p and p.exists():
+def load_bad_cases(feedback_path: Path, low_threshold: float = 3.0, max_cases: int = 15) -> list[dict]:
+    """
+    从 feedback.xlsx 提取低分 bad cases。
+    返回格式：[{"input": ..., "score": ..., "note": ..., "dimension": ...}, ...]
+    """
+    try:
+        import openpyxl
+    except ImportError:
+        print("[warn] 需要 openpyxl：pip install openpyxl", file=sys.stderr)
+        return []
+
+    try:
+        wb = openpyxl.load_workbook(feedback_path, read_only=True, data_only=True)
+        ws = wb.active
+        rows = list(ws.iter_rows(values_only=True))
+        wb.close()
+    except Exception as e:
+        print(f"[warn] 读取 feedback.xlsx 失败：{e}", file=sys.stderr)
+        return []
+
+    if len(rows) < 2:
+        return []
+
+    headers = [str(h) if h is not None else f"col_{i}" for i, h in enumerate(rows[0])]
+
+    # 跳过说明行
+    data_start = 1
+    if len(rows) > 1:
+        sample = " ".join(str(v) for v in rows[1] if v is not None)
+        if re.search(r"(1-5分|填写|说明)", sample):
+            data_start = 2
+
+    # 识别评分列和备注列
+    score_cols = [(i, h) for i, h in enumerate(headers) if h.endswith("_评分")]
+    note_cols  = {h[:-3]: i for i, h in enumerate(headers) if h.endswith("_备注")}
+    data_cols  = [i for i, h in enumerate(headers) if not h.endswith(("_评分", "_备注"))]
+
+    bad_cases = []
+    for row in rows[data_start:]:
+        if all(v is None or str(v).strip() == "" for v in row):
+            continue
+        for score_idx, score_col in score_cols:
             try:
-                return json.loads(p.read_text(encoding="utf-8"))
-            except Exception:
-                pass
-    return []
+                score = float(row[score_idx])
+            except (TypeError, ValueError):
+                continue
+            if score >= low_threshold:
+                continue
+
+            dim = score_col[:-3]
+            note_idx = note_cols.get(dim)
+            note = str(row[note_idx]).strip() if note_idx is not None and row[note_idx] else ""
+
+            # 用数据列组成"输入"描述
+            input_parts = {
+                headers[i]: str(row[i]) for i in data_cols
+                if i < len(row) and row[i] is not None and str(row[i]).strip()
+            }
+
+            bad_cases.append({
+                "dimension": dim,
+                "score": score,
+                "note": note,
+                "input": input_parts,
+            })
+
+    # 按分数从低到高排序，取最严重的
+    bad_cases.sort(key=lambda x: x["score"])
+    return bad_cases[:max_cases]
 
 
-# ── 评估 ──────────────────────────────────────────────────────────────────────
+# ── 语义评估（核心）──────────────────────────────────────────────────────────
 
-def rule_coverage(skill_text: str, patterns: list[dict]) -> float:
-    if not patterns:
-        score = 0.0
-        score += min(len(re.findall(r'"[^"]{3,}"', skill_text)) * 0.4, 3.0)
-        score += min(len(re.findall(r"^\d+\.\s", skill_text, re.MULTILINE)) * 0.5, 3.0)
-        if re.search(r"(问用户|不确定|判断不了|直接问)", skill_text):
-            score += 2.0
-        if re.search(r"(如果|否则|根据)", skill_text):
-            score += 2.0
-        return round(min(score, 10.0), 2)
+def semantic_eval(skill_text: str, bad_cases: list[dict]) -> tuple[float, str]:
+    """
+    LLM 语义评估：对每个 bad case，判断当前 skill 指令能否解决它。
+    返回 (score 0-10, detail)。
+    """
+    if not bad_cases:
+        return _rule_fallback(skill_text), "rule(no-cases)"
 
-    covered = sum(
-        1 for p in patterns
-        if any(kw.lower() in skill_text.lower() for kw in p.get("keywords", []))
-    )
-    coverage = covered / len(patterns)
-    quality = 0.0
-    if re.search(r"(问用户|不确定|直接问)", skill_text):
-        quality += 5.0
-    if len(re.findall(r"^\d+\.\s", skill_text, re.MULTILINE)) >= 3:
-        quality += 5.0
-    return round(coverage * 7.0 + quality * 0.3, 2)
-
-
-def llm_coverage(skill_text: str, patterns: list[dict], feedback_summary: str) -> float | None:
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
-        return None
+        return _rule_fallback(skill_text), "rule(no-api-key)"
+
     try:
         import anthropic
-    except ImportError:
-        return None
-
-    patterns_text = json.dumps(patterns, ensure_ascii=False, indent=2) if patterns else "（无）"
-    prompt = f"""评估改进后的 skill 是否解决了 PM 反馈中的 bad case patterns。
-
-## Bad Case Patterns
-{patterns_text}
-
-## PM 反馈摘要
-{feedback_summary[:500] or "（无）"}
-
-## 当前 Skill（前3000字符）
-{skill_text[:3000]}
-
-评分（0-10）：
-8-10 = skill 改动直接针对 patterns，预期能显著改善
-5-7  = 有改善但未完全覆盖
-0-4  = 改动与 patterns 无关
-
-只输出 JSON：{{"score": <0-10>, "note": "<一句话>"}}"""
-
-    try:
         client = anthropic.Anthropic(api_key=api_key)
-        msg = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=128,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        m = re.search(r'\{[^}]+\}', msg.content[0].text)
-        if m:
-            data = json.loads(m.group())
-            return float(data.get("score", 0))
-    except Exception as e:
-        print(f"[llm] {e}", file=sys.stderr)
-    return None
+    except ImportError:
+        return _rule_fallback(skill_text), "rule(no-anthropic)"
+
+    resolved = 0
+    details = []
+
+    for case in bad_cases:
+        input_str = json.dumps(case["input"], ensure_ascii=False)
+        prompt = f"""你是 skill 质量评审专家。判断改进后的 skill 指令，能否解决 PM 指出的具体问题。
+
+## 当前 Skill 指令
+{skill_text[:4000]}
+
+## PM 评估的 Bad Case
+- 评估维度：{case['dimension']}
+- PM 打分：{case['score']}/5（低分）
+- PM 备注：{case['note'] or '（无备注）'}
+- 对应输入数据：{input_str[:500]}
+
+## 问题
+如果算法严格遵循上述 skill 指令处理这条输入，能否避免 PM 指出的问题？
+
+只回答 JSON：{{"resolved": true/false, "reason": "<一句话说明>"}}"""
+
+        try:
+            msg = client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=128,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            raw = msg.content[0].text
+            m = re.search(r'\{[^}]+\}', raw)
+            if m:
+                data = json.loads(m.group())
+                if data.get("resolved"):
+                    resolved += 1
+                    details.append(f"✅ {case['dimension']}: {data.get('reason','')[:40]}")
+                else:
+                    details.append(f"❌ {case['dimension']}: {data.get('reason','')[:40]}")
+        except Exception as e:
+            print(f"  [llm] case 评估失败：{e}", file=sys.stderr)
+
+    evaluated = len([d for d in details if d])
+    if evaluated == 0:
+        return _rule_fallback(skill_text), "rule(llm-failed)"
+
+    score = round(resolved / len(bad_cases) * 10.0, 2)
+    detail = f"resolved {resolved}/{len(bad_cases)} bad cases"
+    return score, f"semantic({detail})"
 
 
-def evaluate(skill_dir: Path, patterns: list[dict], feedback_summary: str) -> tuple[float, str]:
-    skill_md = skill_dir / "SKILL.md"
-    text = skill_md.read_text(encoding="utf-8") if skill_md.exists() else ""
-    score = llm_coverage(text, patterns, feedback_summary)
-    if score is not None:
-        return score, "llm"
-    return rule_coverage(text, patterns), "rule"
+def _rule_fallback(skill_text: str) -> float:
+    """无 API Key 或解析失败时的规则兜底评分。"""
+    score = 0.0
+    score += min(len(re.findall(r'"[^"]{3,}"', skill_text)) * 0.4, 3.0)
+    score += min(len(re.findall(r"^\d+\.\s", skill_text, re.MULTILINE)) * 0.5, 3.0)
+    if re.search(r"(问用户|不确定|判断不了|直接问)", skill_text):
+        score += 2.0
+    if re.search(r"(如果|否则|根据|当.*时)", skill_text):
+        score += 2.0
+    return round(min(score, 10.0), 2)
+
+
+def evaluate(skill_dir: Path, feedback_path: Path | None) -> tuple[float, str]:
+    skill_text = collect_skill_text(skill_dir)
+    if not feedback_path or not feedback_path.exists():
+        return _rule_fallback(skill_text), "rule(no-feedback)"
+    bad_cases = load_bad_cases(feedback_path)
+    if not bad_cases:
+        return _rule_fallback(skill_text), "rule(no-bad-cases)"
+    return semantic_eval(skill_text, bad_cases)
 
 
 # ── Results 追踪 ──────────────────────────────────────────────────────────────
 
-HEADER = ["round", "timestamp", "change", "score", "baseline", "delta", "decision", "hash"]
+HEADER = ["round", "timestamp", "change", "score", "baseline", "delta", "decision", "hash", "eval_mode"]
 
 
 def init_tsv(path: Path) -> None:
@@ -188,33 +267,31 @@ def log_row(path: Path, row: list) -> None:
         csv.writer(f, delimiter="\t").writerow(row)
 
 
-# ── eval 子命令（Claude 自主循环时调用）──────────────────────────────────────
+# ── eval 子命令（Claude 自主循环调用）────────────────────────────────────────
 
 def cmd_eval(args: argparse.Namespace) -> None:
     """
-    仅评估当前 skill 质量，输出 skill_score: X.X，退出。
-    Claude 在每次修改并 git commit 后调用此命令，读取分数决定保留/回滚。
+    评估当前 skill 质量，输出 skill_score: X.X，退出。
+    Claude 在每次 git commit 后调用此命令读取分数。
     """
     skill_dir = find_skill_dir(args.skill)
     if skill_dir is None:
-        print(f"skill_score: 0.0")
+        print("skill_score: 0.0")
+        print("eval_mode: error(skill-not-found)")
         sys.exit(1)
 
     feedback_path = Path(args.feedback) if args.feedback else None
-    patterns = load_patterns(skill_dir, feedback_path)
+    score, mode = evaluate(skill_dir, feedback_path)
 
-    feedback_summary = ""
-    if feedback_path and (feedback_path.parent / "analysis.md").exists():
-        feedback_summary = (feedback_path.parent / "analysis.md").read_text(encoding="utf-8")[:800]
-
-    score, mode = evaluate(skill_dir, patterns, feedback_summary)
-    # 输出格式固定，方便 grep 提取（对标 autoresearch 的 val_bpb: X）
+    # 固定输出格式，方便 grep（对标 autoresearch 的 val_bpb: X）
     print(f"skill_score: {score}")
     print(f"eval_mode: {mode}")
-    print(f"patterns_loaded: {len(patterns)}")
+    if feedback_path:
+        bad_cases = load_bad_cases(feedback_path) if feedback_path.exists() else []
+        print(f"bad_cases_total: {len(bad_cases)}")
 
 
-# ── run 子命令（有人监督时的交互模式）────────────────────────────────────────
+# ── run 子命令（有人监督的交互模式）──────────────────────────────────────────
 
 def cmd_run(args: argparse.Namespace) -> None:
     skill_dir = find_skill_dir(args.skill)
@@ -224,10 +301,9 @@ def cmd_run(args: argparse.Namespace) -> None:
 
     repo_root = find_repo_root(skill_dir)
     feedback_path = Path(args.feedback) if args.feedback else None
-    patterns = load_patterns(skill_dir, feedback_path)
-    feedback_summary = ""
-    if feedback_path and (feedback_path.parent / "analysis.md").exists():
-        feedback_summary = (feedback_path.parent / "analysis.md").read_text(encoding="utf-8")[:800]
+
+    # 预加载 bad cases，供循环复用
+    bad_cases = load_bad_cases(feedback_path) if (feedback_path and feedback_path.exists()) else []
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     results_path = skill_dir / f"results_{ts}.tsv"
@@ -235,20 +311,28 @@ def cmd_run(args: argparse.Namespace) -> None:
 
     print("=" * 55)
     print(f"  Skill Loop [run]: {skill_dir.name}")
-    print(f"  Patterns: {len(patterns)}  Rounds: {args.rounds}  Target: {args.target}")
+    print(f"  Feedback:  {feedback_path}")
+    print(f"  Bad cases: {len(bad_cases)} 条（低分 case）")
+    print(f"  Rounds: {args.rounds}  Patience: {args.patience}  Target: {args.target}")
     print("=" * 55)
 
-    baseline, mode = evaluate(skill_dir, patterns, feedback_summary)
+    if not bad_cases:
+        print("\n⚠ 未提取到 bad cases，将使用规则评分（效果较差）")
+
+    # 基线
+    baseline, mode = evaluate(skill_dir, feedback_path)
     print(f"\n[基线] score={baseline:.2f}  mode={mode}")
-    log_row(results_path, [0, datetime.now().isoformat(), "baseline",
-                            baseline, baseline, 0, "baseline",
-                            git("rev-parse", "--short", "HEAD", cwd=repo_root)])
+    log_row(results_path, [
+        0, datetime.now().isoformat(), "baseline",
+        baseline, baseline, 0, "baseline",
+        git("rev-parse", "--short", "HEAD", cwd=repo_root), mode,
+    ])
 
     best, best_round, no_improve, stop_reason = baseline, 0, 0, ""
 
     for n in range(1, args.rounds + 1):
         print(f"\n{'─'*45}")
-        print(f"[第 {n}/{args.rounds} 轮]  best={best:.2f}")
+        print(f"[第 {n}/{args.rounds} 轮]  best={best:.2f}/{args.target}")
         print("  修改完成后按 Enter，输入 q 退出，s 跳过")
         try:
             user_input = input("  > ").strip().lower()
@@ -274,7 +358,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         commit_hash = git_commit(skill_dir, f"skill-iter {n}: {summary}", repo_root)
         print(f"  commit: {commit_hash}")
 
-        new_score, mode = evaluate(skill_dir, patterns, feedback_summary)
+        new_score, mode = evaluate(skill_dir, feedback_path)
         delta = new_score - best
         print(f"  score={new_score:.2f}  delta={delta:+.2f}  mode={mode}")
 
@@ -289,8 +373,10 @@ def cmd_run(args: argparse.Namespace) -> None:
             decision = "revert"
             commit_hash = "-"
 
-        log_row(results_path, [n, datetime.now().isoformat(), summary,
-                                new_score, baseline, f"{delta:+.2f}", decision, commit_hash])
+        log_row(results_path, [
+            n, datetime.now().isoformat(), summary,
+            new_score, baseline, f"{delta:+.2f}", decision, commit_hash, mode,
+        ])
 
         if best >= args.target:
             stop_reason = f"达到目标分 {args.target}"
@@ -310,18 +396,16 @@ def cmd_run(args: argparse.Namespace) -> None:
 # ── 主入口 ────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Skill 迭代 harness")
+    parser = argparse.ArgumentParser(description="基于 feedback.xlsx 语义评估的 Skill 迭代 harness")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    # eval 子命令
-    p_eval = sub.add_parser("eval", help="评估当前 skill 质量（Claude 自主循环时调用）")
+    p_eval = sub.add_parser("eval", help="语义评估当前 skill（Claude 自主循环时调用）")
     p_eval.add_argument("skill", help="skill 名称或路径")
-    p_eval.add_argument("--feedback", default=None, help="feedback.xlsx 路径")
+    p_eval.add_argument("--feedback", required=True, help="feedback.xlsx 路径")
 
-    # run 子命令
-    p_run = sub.add_parser("run", help="交互式迭代循环（有人监督时使用）")
+    p_run = sub.add_parser("run", help="有人监督的交互式迭代循环")
     p_run.add_argument("skill", help="skill 名称或路径")
-    p_run.add_argument("--feedback", default=None, help="feedback.xlsx 路径")
+    p_run.add_argument("--feedback", required=True, help="feedback.xlsx 路径")
     p_run.add_argument("--rounds", type=int, default=20)
     p_run.add_argument("--patience", type=int, default=5)
     p_run.add_argument("--target", type=float, default=8.5)

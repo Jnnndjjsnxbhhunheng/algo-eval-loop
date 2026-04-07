@@ -167,17 +167,33 @@ pattern 出现频率最高 → 优先改
 
 ---
 
-## 代理评估逻辑（每轮打分）
+## 评估逻辑（语义评估）
 
-不等 PM 反馈，用以下代理指标衡量每轮改动质量：
+**核心公式（只看一件事）：**
 
-1. **Pattern 覆盖率**（主要）：改动后的 skill 描述，是否能处理分析出的 bad case patterns？
-   - 用 LLM 判断（需要 ANTHROPIC_API_KEY）
-   - 无 API Key 时用规则：关键词覆盖率
+```
+skill_score = resolved_bad_cases / total_bad_cases × 10
+```
 
-2. **描述质量**（辅助）：触发词数量、步骤完整性、边界处理
+每轮调用 `skill_loop.py eval`，LLM 逐条判断：
+> 如果算法严格遵循当前 skill 指令处理这条输入，能否避免 PM 指出的问题？
 
-综合分 = 覆盖率得分 × 0.7 + 描述质量得分 × 0.3
+- 能解决 → resolved + 1
+- 不能 → 跳过
+
+**示例：**
+```
+Bad cases = 12 条（PM 低分 case）
+Round 3 改进后：
+  ✅ 品牌档次权重问题   → resolved
+  ✅ 冷门品牌排除逻辑   → resolved
+  ❌ 热门品牌遗漏问题   → 未解决
+  ...共解决 9/12
+
+skill_score = 9/12 × 10 = 7.5
+```
+
+无 ANTHROPIC_API_KEY 时降级为规则评分（效果较差，建议配置）。
 
 ---
 
