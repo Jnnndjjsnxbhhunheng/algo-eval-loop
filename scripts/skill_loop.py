@@ -171,13 +171,18 @@ def semantic_eval(skill_text: str, bad_cases: list[dict]) -> tuple[float, str]:
     if not bad_cases:
         return _rule_fallback(skill_text), "rule(no-cases)"
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    # 支持百度内部 token（ANTHROPIC_AUTH_TOKEN）和标准 API Key（ANTHROPIC_API_KEY）
+    api_key = os.environ.get("ANTHROPIC_AUTH_TOKEN") or os.environ.get("ANTHROPIC_API_KEY")
+    base_url = os.environ.get("ANTHROPIC_BASE_URL")
     if not api_key:
         return _rule_fallback(skill_text), "rule(no-api-key)"
 
     try:
         import anthropic
-        client = anthropic.Anthropic(api_key=api_key)
+        client = anthropic.Anthropic(
+            api_key=api_key,
+            **({"base_url": base_url} if base_url else {}),
+        )
     except ImportError:
         return _rule_fallback(skill_text), "rule(no-anthropic)"
 

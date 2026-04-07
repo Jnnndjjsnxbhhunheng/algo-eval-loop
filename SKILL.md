@@ -193,7 +193,10 @@ Round 3 改进后：
 skill_score = 9/12 × 10 = 7.5
 ```
 
-无 ANTHROPIC_API_KEY 时降级为规则评分（效果较差，建议配置）。
+无 API 凭证时降级为规则评分（效果较差，建议配置）。
+支持两种凭证方式：
+- 百度内部：`ANTHROPIC_AUTH_TOKEN` + `ANTHROPIC_BASE_URL`
+- 标准 API：`ANTHROPIC_API_KEY`
 
 ---
 
