@@ -85,7 +85,7 @@ python ~/.claude/skills/algo-eval-loop/scripts/skill_loop.py load-cases \
 results = []
 for each bad_case in bad_cases:          ← 内层：评估用，跑完所有，不在这里改 skill
     output = 按目标 skill 指令执行完整 pipeline(bad_case["input"])
-    resolved = 输出是否解决了 bad_case["pm_note"] 指出的问题？
+    resolved = 输出是否完全解决了 bad_case["pm_note"] 中所有问题？（部分解决算 False）
     results.append(resolved)
 
 baseline_score = sum(results) / len(results) * 10
@@ -122,7 +122,7 @@ python skill_loop.py commit <skill目录> -m "skill-iter N: <改动描述>"
 results = []
 for each bad_case in bad_cases:          ← 注意：跑完全部再统计，不要边跑边改
     output = 按更新后的 skill 执行完整 pipeline(bad_case["input"])
-    resolved = 输出是否解决了 pm_note 的问题？
+    resolved = 输出是否解决了 pm_note 的问题？（必须完全解决 pm_note 中所有的问题，才算 resolved=True；部分解决算 False）
     results.append(resolved)
 
 new_score = sum(results) / len(results) * 10
