@@ -86,7 +86,8 @@ autoresearch:  修改 train.py → python train.py（跑全部训练数据）→
 
 ```bash
 python ~/.claude/skills/algo-eval-loop/scripts/skill_loop.py load-cases \
-  --feedback <feedback.xlsx路径> --threshold 3.0 --max 15
+  --feedback <feedback.xlsx路径> --threshold 3.0 --max 15 \
+  > bad_cases.json
 ```
 
 输出 JSON，每条包含 `input`、`dimension`、`pm_score`、`pm_note`。
@@ -99,13 +100,9 @@ python ~/.claude/skills/algo-eval-loop/scripts/skill_loop.py load-cases \
 
 **3. 建立基线（Round 0）**
 
-用脚本并发跑全部 bad cases（batch=10，并发调用 Agent API）：
+并发调用 Agent API 跑全部 bad cases，再用 LLM API 评判结果：
 
 ```bash
-# 先把 bad cases 保存到文件
-python skill_loop.py load-cases --feedback <feedback.xlsx路径> --threshold 3.0 --max 15 \
-  > bad_cases.json
-
 # 并发跑完 pipeline 后，将结果（含 actual_output 字段）保存为 pipeline_results.json
 # 然后并发评估，输出 eval_results.json 并打印得分
 python skill_loop.py evaluate \
@@ -197,8 +194,8 @@ python skill_loop.py evaluate \
 # stdout: {"score": X.X, "resolved": N, "total": M}
 ```
 
-> 原理：并发调用 Agent API（`asyncio.Semaphore(10)` 控制并发量），
-> 每条 case 独立调用一次模型做语义判断，全部完成后汇总分数。
+> 原理：并发调用 LLM API（`asyncio.Semaphore(10)` 控制并发量），
+> 每条 case 独立调用一次 GLM-5 做语义判断，全部完成后汇总分数。
 > 详细结果（含每条 reason）保存在 `eval_results.json`。
 
 #### Step 5：保留或回滚
@@ -213,14 +210,6 @@ python skill_loop.py log --tsv results.tsv --round N --score <new_score> --decis
 ```
 
 #### Step 6：直接进入下一轮，不询问用户
-
----
-
-## Pipeline 执行要点
-
-- **严格按目标 skill 的指令执行全部阶段**，不要跳步骤
-- **使用目标 skill 需要的 MCP 工具**（如 search_notes、extract_entities 等）
-- **判断 resolved 时只看 pm_note**：PM 说"缺少主流品牌"，就看输出里有没有主流品牌
 
 ---
 
