@@ -27,7 +27,7 @@ autoresearch:  修改 train.py → python train.py（跑全部训练数据）→
 
 ## ⚠️ 评估方式：必须用大模型评估，严禁自写规则脚本
 
-评估 bad case 是否 resolved，**唯一正确方式**是调用 `skill_loop.py evaluate`，它内部用 `claude -p` 做大模型判断。
+评估 bad case 是否 resolved，**唯一正确方式**是调用 `skill_loop.py evaluate`，它接收真实 pipeline 输出，用大模型语义判断是否 resolved。
 
 **严禁自己编写规则匹配脚本来评估**，例如：
 - 用正则提取 PM 备注中的品牌名，再检查输出里有没有
@@ -106,10 +106,10 @@ python ~/.claude/skills/algo-eval-loop/scripts/skill_loop.py load-cases \
 python skill_loop.py load-cases --feedback <feedback.xlsx路径> --threshold 3.0 --max 15 \
   > bad_cases.json
 
-# 并发评估，输出 eval_results.json 并打印得分
+# 并发跑完 pipeline 后，将结果（含 actual_output 字段）保存为 pipeline_results.json
+# 然后并发评估，输出 eval_results.json 并打印得分
 python skill_loop.py evaluate \
-  --cases bad_cases.json \
-  --skill-path <目标skill目录> \
+  --results pipeline_results.json \
   --batch 10 \
   --model $OPENAI_MODEL \
   --output eval_results.json
@@ -187,10 +187,10 @@ python skill_loop.py commit <skill目录> -m "skill-iter N: <改动描述>"
 #### Step 4：评估（脚本并发跑，batch=10，不在这里改 skill）
 
 ```bash
-# 一条命令跑完全部 bad cases，内部 10 并发，自动统计分数
+# pipeline 并发跑完后，把结果（含 actual_output 字段）保存为 pipeline_results.json
+# 再用 evaluate 并发评判，内部 10 并发，自动统计分数
 python skill_loop.py evaluate \
-  --cases bad_cases.json \
-  --skill-path <目标skill目录> \
+  --results pipeline_results.json \
   --batch 10 \
   --model $OPENAI_MODEL \
   --output eval_results.json
