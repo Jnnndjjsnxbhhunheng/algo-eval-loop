@@ -93,10 +93,24 @@ python ~/.claude/skills/algo-eval-loop/scripts/skill_loop.py load-cases \
 输出 JSON，每条包含 `input`、`dimension`、`pm_score`、`pm_note`。
 **这份列表在整个迭代过程中固定不变，每轮都用同一批 cases 打分。**
 
-**2. 找到目标 skill**
+**2. 找到目标 skill，并完整探索整个系统**
 
 搜索顺序：`~/.claude/skills/{name}/` → `/mnt/skills/user/{name}/` → 当前项目目录。
-读取 SKILL.md 及所有子文件，理解 pipeline 结构。
+
+**⚠️ 只读 SKILL.md 是不够的。** 在做任何修改决定之前，必须完整理解数据流经过的每一层：
+
+- **SKILL.md**：理解 pipeline 的阶段划分和模型介入点
+- **Pipeline 脚本**（`pipelines/*.sh`）：每个阶段实际执行什么？脚本有哪些分支逻辑？
+- **MCP 调用库**（`lib/mcp_call.sh` 等）：MCP 工具如何被调用？参数是什么？
+- **后端服务**（`backend/*.py` 等）：MCP 工具内部如何实现？`extract_entities` 的噪声从哪里来？`filter_entity` 的过滤逻辑是什么？
+- **中间文件格式**：各阶段输入输出的 JSON 结构是什么？
+
+**探索完成的标志**：能回答以下问题——
+1. 一条 bad case 的输入，经过哪些脚本、哪些 MCP 调用、哪些后端逻辑，最终变成输出？
+2. 数据在哪个环节出现了噪声/错误？是 MCP 提取问题、脚本逻辑问题，还是模型判断问题？
+3. 修改 SKILL.md 能解决吗？还是需要改脚本或后端？
+
+**常见错误**：只看 SKILL.md 就开始改，把所有问题归因于"模型没执行好"，忽略了脚本和后端层面的设计缺陷。
 
 **3. 建立基线（Round 0）**
 
