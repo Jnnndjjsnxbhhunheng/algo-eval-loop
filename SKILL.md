@@ -79,20 +79,24 @@ python ~/.claude/skills/algo-eval-loop/scripts/skill_loop.py load-cases \
 
 **3. 建立基线（Round 0）**
 
-对全部 bad cases 各跑一次完整 pipeline，统计 resolved 数量：
+用脚本并发跑全部 bad cases（batch=10，自动启动 10 个并行 `claude -p` 子进程）：
 
-```
-results = []
-for each bad_case in bad_cases:          ← 内层：评估用，跑完所有，不在这里改 skill
-    output = 按目标 skill 指令执行完整 pipeline(bad_case["input"])
-    resolved = 输出是否完全解决了 bad_case["pm_note"] 中所有问题？（部分解决算 False）
-    results.append(resolved)
+```bash
+# 先把 bad cases 保存到文件
+python skill_loop.py load-cases --feedback <feedback.xlsx路径> --threshold 3.0 --max 15 \
+  > bad_cases.json
 
-baseline_score = sum(results) / len(results) * 10
+# 并发评估，输出 eval_results.json 并打印得分
+python skill_loop.py evaluate \
+  --cases bad_cases.json \
+  --skill-path <目标skill目录> \
+  --batch 10 \
+  --output eval_results.json
+# stdout: {"score": X.X, "resolved": N, "total": M}
 ```
 
 ```bash
-python skill_loop.py log --tsv results.tsv --round 0 --score <baseline_score> --decision baseline
+python skill_loop.py log --tsv results.tsv --round 0 --score <score> --decision baseline
 ```
 
 ---
@@ -116,17 +120,21 @@ python skill_loop.py log --tsv results.tsv --round 0 --score <baseline_score> --
 python skill_loop.py commit <skill目录> -m "skill-iter N: <改动描述>"
 ```
 
-#### Step 4：评估（内层循环，跑完全部，不在这里改 skill）
+#### Step 4：评估（脚本并发跑，batch=10，不在这里改 skill）
 
+```bash
+# 一条命令跑完全部 bad cases，内部 10 并发，自动统计分数
+python skill_loop.py evaluate \
+  --cases bad_cases.json \
+  --skill-path <目标skill目录> \
+  --batch 10 \
+  --output eval_results.json
+# stdout: {"score": X.X, "resolved": N, "total": M}
 ```
-results = []
-for each bad_case in bad_cases:          ← 注意：跑完全部再统计，不要边跑边改
-    output = 按更新后的 skill 执行完整 pipeline(bad_case["input"])
-    resolved = 输出是否解决了 pm_note 的问题？（必须完全解决 pm_note 中所有的问题，才算 resolved=True；部分解决算 False）
-    results.append(resolved)
 
-new_score = sum(results) / len(results) * 10
-```
+> 原理：每条 case 独立启动 `claude -p` 子进程执行完整 pipeline，
+> `asyncio.Semaphore(10)` 控制并发量，全部跑完后再汇总分数。
+> 详细结果（含每条 reason）保存在 `eval_results.json`。
 
 #### Step 5：保留或回滚
 

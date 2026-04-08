@@ -2,24 +2,26 @@
 """
 skill_loop.py — 纯基础设施 harness
 
-只做四件事，不做评估：
+五个子命令：
   load-cases  从 feedback.xlsx 提取 bad cases，输出 JSON 供 Claude 使用
+  evaluate    并发跑 bad cases（batch=10），输出 eval_results.json
   commit      git add + commit skill 目录
   revert      git reset --hard HEAD~1
   log         追加一行记录到 results.tsv
 
-评估和 pipeline 执行由 Claude 通过工具调用完成（见 SKILL.md）。
-
 用法：
   python skill_loop.py load-cases --feedback feedback.xlsx [--threshold 3] [--max 15]
+  python skill_loop.py evaluate --cases bad_cases.json --skill-path <skill目录> [--batch 10] [--output eval_results.json]
   python skill_loop.py commit <skill路径> [--message "描述"]
   python skill_loop.py revert [--repo <repo根目录>]
   python skill_loop.py log --tsv results.tsv --round 3 --score 7.5 --decision advance --hash abc1234
 """
 
 import argparse
+import asyncio
 import csv
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -29,6 +31,149 @@ try:
     HAS_OPENPYXL = True
 except ImportError:
     HAS_OPENPYXL = False
+
+
+# ── evaluate（并发评估） ────────────────────────────────────────────────────────
+
+EVAL_PROMPT_TEMPLATE = """\
+你是一个 pipeline 评估助手。以下是目标 skill 的完整说明，描述了一个 pipeline 流程。
+请严格按照 skill 指令，对给定的输入执行完整 pipeline，然后判断输出是否解决了 PM 的备注问题。
+
+【Skill 说明】
+{skill_text}
+
+【待评估案例】
+维度：{dimension}
+PM 原始评分：{pm_score}
+PM 备注（必须完全解决其中所有问题，才算 resolved=True）：
+{pm_note}
+
+输入数据：
+{input_json}
+
+请执行完整 pipeline，然后以如下 JSON 格式输出（只输出 JSON，不要其他文字）：
+{{"resolved": true 或 false, "output_summary": "pipeline 输出的核心内容（100字以内）", "reason": "判断 resolved 的理由（说明哪些问题解决了、哪些没有）"}}
+"""
+
+
+async def _run_one_case(semaphore: asyncio.Semaphore, skill_text: str, case: dict, idx: int, total: int) -> dict:
+    """在 semaphore 控制下，用 claude -p 跑单条 case 的 pipeline 评估。"""
+    async with semaphore:
+        prompt = EVAL_PROMPT_TEMPLATE.format(
+            skill_text=skill_text,
+            dimension=case.get("dimension", ""),
+            pm_score=case.get("pm_score", ""),
+            pm_note=case.get("pm_note", ""),
+            input_json=json.dumps(case.get("input", {}), ensure_ascii=False, indent=2),
+        )
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "claude", "-p", prompt,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=180)
+            raw = stdout.decode("utf-8", errors="replace").strip()
+        except asyncio.TimeoutError:
+            print(f"  [{idx+1}/{total}] row={case.get('row','?')} TIMEOUT", file=sys.stderr)
+            return {**case, "resolved": False, "output_summary": "", "reason": "评估超时"}
+        except Exception as e:
+            print(f"  [{idx+1}/{total}] row={case.get('row','?')} ERROR: {e}", file=sys.stderr)
+            return {**case, "resolved": False, "output_summary": "", "reason": f"执行错误: {e}"}
+
+        # 从输出中提取 JSON（claude 可能会附带解释文字）
+        result_json = _extract_json(raw)
+        resolved = bool(result_json.get("resolved", False)) if result_json else False
+        mark = "✓" if resolved else "✗"
+        print(f"  [{idx+1}/{total}] row={case.get('row','?')} {mark}  {result_json.get('reason','')[:60] if result_json else raw[:60]}",
+              file=sys.stderr)
+
+        return {
+            **case,
+            "resolved": resolved,
+            "output_summary": result_json.get("output_summary", "") if result_json else "",
+            "reason": result_json.get("reason", raw[:200]) if result_json else raw[:200],
+        }
+
+
+def _extract_json(text: str) -> dict | None:
+    """从文本中提取第一个 JSON 对象。"""
+    # 直接解析
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    # 找 {...} 块
+    match = re.search(r'\{[^{}]*"resolved"[^{}]*\}', text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group())
+        except json.JSONDecodeError:
+            pass
+    return None
+
+
+async def _evaluate_all(cases: list, skill_text: str, batch: int) -> list:
+    semaphore = asyncio.Semaphore(batch)
+    tasks = [
+        _run_one_case(semaphore, skill_text, case, idx, len(cases))
+        for idx, case in enumerate(cases)
+    ]
+    return await asyncio.gather(*tasks)
+
+
+def cmd_evaluate(args: argparse.Namespace) -> None:
+    """
+    并发跑全部 bad cases，输出评估结果 JSON 和汇总分数。
+    每个 case 独立启动 `claude -p` 子进程，semaphore 控制并发量。
+    """
+    # 加载 cases
+    cases_path = Path(args.cases)
+    if not cases_path.exists():
+        print(json.dumps({"error": f"文件不存在: {cases_path}"}))
+        sys.exit(1)
+    cases = json.loads(cases_path.read_text("utf-8"))
+    if not cases:
+        print(json.dumps({"score": 0, "resolved": 0, "total": 0, "results": []}))
+        return
+
+    # 加载 skill 文本
+    skill_path = Path(args.skill_path)
+    skill_md = skill_path / "SKILL.md"
+    if not skill_md.exists():
+        # 尝试找任意 .md
+        mds = list(skill_path.glob("*.md"))
+        skill_md = mds[0] if mds else None
+    if skill_md and skill_md.exists():
+        skill_text = skill_md.read_text("utf-8")
+    else:
+        print(f"警告：在 {skill_path} 下找不到 SKILL.md，将使用目录名作为 skill 标识", file=sys.stderr)
+        skill_text = f"Skill: {skill_path.name}"
+
+    print(f"开始评估：{len(cases)} 条 bad cases，并发 batch={args.batch}", file=sys.stderr)
+
+    results = asyncio.run(_evaluate_all(cases, skill_text, args.batch))
+
+    resolved_count = sum(1 for r in results if r.get("resolved"))
+    score = resolved_count / len(results) * 10
+
+    output = {
+        "score": round(score, 2),
+        "resolved": resolved_count,
+        "total": len(results),
+        "results": results,
+    }
+
+    out_path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(output, ensure_ascii=False, indent=2), "utf-8")
+
+    print(f"\n评估完成：score={score:.1f}  resolved={resolved_count}/{len(results)}", file=sys.stderr)
+    print(json.dumps({"score": round(score, 2), "resolved": resolved_count, "total": len(results)}))
+
+
+
 
 
 # ── Git ───────────────────────────────────────────────────────────────────────
@@ -79,7 +224,6 @@ def cmd_load_cases(args: argparse.Namespace) -> None:
     headers = [str(h) if h is not None else f"col_{i}" for i, h in enumerate(rows[0])]
 
     # 跳过说明行
-    import re
     data_start = 1
     if len(rows) > 1:
         sample = " ".join(str(v) for v in rows[1] if v is not None)
@@ -202,7 +346,7 @@ def cmd_log(args: argparse.Namespace) -> None:
 # ── 主入口 ────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Skill 迭代基础设施 harness（不含评估逻辑）")
+    parser = argparse.ArgumentParser(description="Skill 迭代基础设施 harness")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     # load-cases
@@ -210,6 +354,13 @@ def main() -> None:
     p.add_argument("--feedback", required=True, help="feedback.xlsx 路径")
     p.add_argument("--threshold", type=float, default=3.0, help="低分阈值（默认 3.0）")
     p.add_argument("--max", type=int, default=15, help="最多返回几条（默认 15）")
+
+    # evaluate
+    p = sub.add_parser("evaluate", help="并发跑 bad cases，输出 eval_results.json 和得分")
+    p.add_argument("--cases", required=True, help="bad_cases.json 路径（load-cases 的输出）")
+    p.add_argument("--skill-path", required=True, help="目标 skill 目录路径（含 SKILL.md）")
+    p.add_argument("--batch", type=int, default=10, help="并发量（默认 10）")
+    p.add_argument("--output", default="eval_results.json", help="结果输出路径（默认 eval_results.json）")
 
     # commit
     p = sub.add_parser("commit", help="git add + commit skill 目录")
@@ -232,9 +383,10 @@ def main() -> None:
     args = parser.parse_args()
     {
         "load-cases": cmd_load_cases,
-        "commit": cmd_commit,
-        "revert": cmd_revert,
-        "log": cmd_log,
+        "evaluate":   cmd_evaluate,
+        "commit":     cmd_commit,
+        "revert":     cmd_revert,
+        "log":        cmd_log,
     }[args.cmd](args)
 
 
