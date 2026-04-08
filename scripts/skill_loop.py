@@ -304,15 +304,6 @@ def cmd_commit(args: argparse.Namespace) -> None:
         )
         sys.exit(1)
 
-    if args.generalizes.strip().lower() != "yes":
-        print(
-            "Error: --generalizes 必须为 'yes'。\n"
-            "当前修改对未见过的新输入无效，属于特解，禁止提交。\n"
-            "请回到 Step 1 重新分析根因。",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
     skill_path = Path(args.skill_path)
     repo_root = find_repo_root(skill_path)
     git("add", str(skill_path.resolve()), cwd=repo_root)
@@ -405,8 +396,6 @@ def main() -> None:
     p.add_argument("skill_path", help="skill 目录路径")
     p.add_argument("--change-type", required=True,
                    help=f"修改类型，只允许：{', '.join(sorted(VALID_CHANGE_TYPES))}。填 data/example 会被拒绝")
-    p.add_argument("--generalizes", required=True,
-                   help="换成未见过的新输入，修改仍然有效吗？必须填 yes，填 no 会被拒绝")
     p.add_argument("--message", "-m", default=None, help="commit message")
 
     # revert

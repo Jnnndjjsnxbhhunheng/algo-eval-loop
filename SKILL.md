@@ -177,7 +177,6 @@ python skill_loop.py log --tsv results.tsv --round 0 --score <score> --decision 
 ```bash
 python skill_loop.py commit <skill目录> \
   --change-type <类型> \
-  --generalizes <yes|no> \
   -m "skill-iter N: <改动描述>"
 ```
 
@@ -186,9 +185,7 @@ python skill_loop.py commit <skill目录> \
 - `logic`：改了处理逻辑、流程分支
 - `checkpoint`：改了验证步骤或检查点
 
-`--generalizes` 必须填 `yes`——把 bad cases 的输入换成从未见过的新输入，修改仍然有效吗？填 `no` 同样报错退出。
-
-**如果无法填 `yes`，说明这是特解，回到 Step 1 重新分析根因。**
+**如果无法归入这三类，说明是 data/example 类的 overfit 修改，回到 Step 1 重新分析根因。**
 
 #### Step 4：评估（脚本并发跑，batch=10，不在这里改 skill）
 
