@@ -11,26 +11,32 @@ skill_loop.py — 纯基础设施 harness
 
 用法：
   python skill_loop.py load-cases --feedback feedback.xlsx [--threshold 3] [--max 15]
-  python skill_loop.py evaluate --cases bad_cases.json --skill-path <skill目录> [--batch 10] [--output eval_results.json] [--model claude-opus-4-6]
+  python skill_loop.py evaluate --cases bad_cases.json --skill-path <skill目录> [--batch 10] [--output eval_results.json]
   python skill_loop.py commit <skill路径> [--message "描述"]
   python skill_loop.py revert [--repo <repo根目录>]
   python skill_loop.py log --tsv results.tsv --round 3 --score 7.5 --decision advance --hash abc1234
+
+环境变量：
+  OPENAI_API_KEY     API 密钥（必填）
+  OPENAI_BASE_URL    API base URL（必填，如 https://open.bigmodel.cn/api/paas/v4）
+  OPENAI_MODEL       模型名称（默认 GLM-5，可被 --model 覆盖）
 """
 
 import argparse
 import asyncio
 import csv
 import json
+import os
 import re
 import subprocess
 import sys
 from pathlib import Path
 
 try:
-    import anthropic
-    HAS_ANTHROPIC = True
+    from openai import AsyncOpenAI
+    HAS_OPENAI = True
 except ImportError:
-    HAS_ANTHROPIC = False
+    HAS_OPENAI = False
 
 try:
     import openpyxl
@@ -38,7 +44,7 @@ try:
 except ImportError:
     HAS_OPENPYXL = False
 
-DEFAULT_EVAL_MODEL = "claude-opus-4-6"
+DEFAULT_EVAL_MODEL = os.environ.get("OPENAI_MODEL", "GLM-5")
 
 
 # ── evaluate（并发评估） ────────────────────────────────────────────────────────
@@ -64,8 +70,8 @@ PM 备注（必须完全解决其中所有问题，才算 resolved=True）：
 """
 
 
-async def _run_one_case(semaphore: asyncio.Semaphore, skill_text: str, case: dict, idx: int, total: int, model: str) -> dict:
-    """在 semaphore 控制下，直接调用 Anthropic API 评估单条 case。"""
+async def _run_one_case(semaphore: asyncio.Semaphore, client: "AsyncOpenAI", skill_text: str, case: dict, idx: int, total: int, model: str) -> dict:
+    """在 semaphore 控制下，调用 OpenAI-compatible API 评估单条 case。"""
     async with semaphore:
         prompt = EVAL_PROMPT_TEMPLATE.format(
             skill_text=skill_text,
@@ -76,13 +82,12 @@ async def _run_one_case(semaphore: asyncio.Semaphore, skill_text: str, case: dic
         )
 
         try:
-            client = anthropic.AsyncAnthropic()
-            message = await client.messages.create(
+            response = await client.chat.completions.create(
                 model=model,
                 max_tokens=1024,
                 messages=[{"role": "user", "content": prompt}],
             )
-            raw = message.content[0].text.strip()
+            raw = response.choices[0].message.content.strip()
         except Exception as e:
             print(f"  [{idx+1}/{total}] row={case.get('row','?')} ERROR: {e}", file=sys.stderr)
             return {**case, "resolved": False, "output_summary": "", "reason": f"执行错误: {e}"}
@@ -119,9 +124,13 @@ def _extract_json(text: str) -> dict | None:
 
 
 async def _evaluate_all(cases: list, skill_text: str, batch: int, model: str) -> list:
+    client = AsyncOpenAI(
+        api_key=os.environ.get("OPENAI_API_KEY"),
+        base_url=os.environ.get("OPENAI_BASE_URL"),
+    )
     semaphore = asyncio.Semaphore(batch)
     tasks = [
-        _run_one_case(semaphore, skill_text, case, idx, len(cases), model)
+        _run_one_case(semaphore, client, skill_text, case, idx, len(cases), model)
         for idx, case in enumerate(cases)
     ]
     return await asyncio.gather(*tasks)
@@ -130,10 +139,16 @@ async def _evaluate_all(cases: list, skill_text: str, batch: int, model: str) ->
 def cmd_evaluate(args: argparse.Namespace) -> None:
     """
     并发调用 LLM API 跑全部 bad cases，输出评估结果 JSON 和汇总分数。
-    使用 asyncio.Semaphore 控制并发量，直接调用 Anthropic API。
+    使用 asyncio.Semaphore 控制并发量，读取 OPENAI_* 环境变量。
     """
-    if not HAS_ANTHROPIC:
-        print(json.dumps({"error": "需要 anthropic SDK: pip install anthropic"}))
+    if not HAS_OPENAI:
+        print(json.dumps({"error": "需要 openai SDK: pip install openai"}))
+        sys.exit(1)
+    if not os.environ.get("OPENAI_API_KEY"):
+        print(json.dumps({"error": "缺少环境变量 OPENAI_API_KEY"}))
+        sys.exit(1)
+    if not os.environ.get("OPENAI_BASE_URL"):
+        print(json.dumps({"error": "缺少环境变量 OPENAI_BASE_URL"}))
         sys.exit(1)
     # 加载 cases
     cases_path = Path(args.cases)
@@ -158,7 +173,7 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
         print(f"警告：在 {skill_path} 下找不到 SKILL.md，将使用目录名作为 skill 标识", file=sys.stderr)
         skill_text = f"Skill: {skill_path.name}"
 
-    model = getattr(args, "model", DEFAULT_EVAL_MODEL)
+    model = getattr(args, "model", None) or DEFAULT_EVAL_MODEL
     print(f"开始评估：{len(cases)} 条 bad cases，并发 batch={args.batch}，模型={model}", file=sys.stderr)
 
     results = asyncio.run(_evaluate_all(cases, skill_text, args.batch, model))
@@ -368,7 +383,7 @@ def main() -> None:
     p.add_argument("--cases", required=True, help="bad_cases.json 路径（load-cases 的输出）")
     p.add_argument("--skill-path", required=True, help="目标 skill 目录路径（含 SKILL.md）")
     p.add_argument("--batch", type=int, default=10, help="并发量（默认 10）")
-    p.add_argument("--model", default=DEFAULT_EVAL_MODEL, help=f"评估用的模型（默认 {DEFAULT_EVAL_MODEL}）")
+    p.add_argument("--model", default=None, help="模型名称，覆盖 OPENAI_MODEL 环境变量")
     p.add_argument("--output", default="eval_results.json", help="结果输出路径（默认 eval_results.json）")
 
     # commit

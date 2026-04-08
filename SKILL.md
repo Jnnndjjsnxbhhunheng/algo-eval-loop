@@ -111,7 +111,7 @@ python skill_loop.py evaluate \
   --cases bad_cases.json \
   --skill-path <目标skill目录> \
   --batch 10 \
-  --model claude-opus-4-6 \
+  --model $OPENAI_MODEL \
   --output eval_results.json
 # stdout: {"score": X.X, "resolved": N, "total": M}
 ```
@@ -192,7 +192,7 @@ python skill_loop.py evaluate \
   --cases bad_cases.json \
   --skill-path <目标skill目录> \
   --batch 10 \
-  --model claude-opus-4-6 \
+  --model $OPENAI_MODEL \
   --output eval_results.json
 # stdout: {"score": X.X, "resolved": N, "total": M}
 ```
