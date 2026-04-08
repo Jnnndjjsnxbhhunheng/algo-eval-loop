@@ -99,7 +99,7 @@ python ~/.claude/skills/algo-eval-loop/scripts/skill_loop.py load-cases \
 
 **3. 建立基线（Round 0）**
 
-用脚本并发跑全部 bad cases（batch=10，自动启动 10 个并行 `claude -p` 子进程）：
+用脚本并发跑全部 bad cases（batch=10，并发调用 LLM API）：
 
 ```bash
 # 先把 bad cases 保存到文件
@@ -111,6 +111,7 @@ python skill_loop.py evaluate \
   --cases bad_cases.json \
   --skill-path <目标skill目录> \
   --batch 10 \
+  --model claude-opus-4-6 \
   --output eval_results.json
 # stdout: {"score": X.X, "resolved": N, "total": M}
 ```
@@ -191,12 +192,13 @@ python skill_loop.py evaluate \
   --cases bad_cases.json \
   --skill-path <目标skill目录> \
   --batch 10 \
+  --model claude-opus-4-6 \
   --output eval_results.json
 # stdout: {"score": X.X, "resolved": N, "total": M}
 ```
 
-> 原理：每条 case 独立启动 `claude -p` 子进程执行完整 pipeline，
-> `asyncio.Semaphore(10)` 控制并发量，全部跑完后再汇总分数。
+> 原理：并发调用 LLM API（`asyncio.Semaphore(10)` 控制并发量），
+> 每条 case 独立调用一次模型做语义判断，全部完成后汇总分数。
 > 详细结果（含每条 reason）保存在 `eval_results.json`。
 
 #### Step 5：保留或回滚

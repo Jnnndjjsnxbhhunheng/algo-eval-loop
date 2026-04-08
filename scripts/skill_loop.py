@@ -4,14 +4,14 @@ skill_loop.py — 纯基础设施 harness
 
 五个子命令：
   load-cases  从 feedback.xlsx 提取 bad cases，输出 JSON 供 Claude 使用
-  evaluate    并发跑 bad cases（batch=10），输出 eval_results.json
+  evaluate    并发调用 LLM API 跑 bad cases（batch=10），输出 eval_results.json
   commit      git add + commit skill 目录
   revert      git reset --hard HEAD~1
   log         追加一行记录到 results.tsv
 
 用法：
   python skill_loop.py load-cases --feedback feedback.xlsx [--threshold 3] [--max 15]
-  python skill_loop.py evaluate --cases bad_cases.json --skill-path <skill目录> [--batch 10] [--output eval_results.json]
+  python skill_loop.py evaluate --cases bad_cases.json --skill-path <skill目录> [--batch 10] [--output eval_results.json] [--model claude-opus-4-6]
   python skill_loop.py commit <skill路径> [--message "描述"]
   python skill_loop.py revert [--repo <repo根目录>]
   python skill_loop.py log --tsv results.tsv --round 3 --score 7.5 --decision advance --hash abc1234
@@ -27,10 +27,18 @@ import sys
 from pathlib import Path
 
 try:
+    import anthropic
+    HAS_ANTHROPIC = True
+except ImportError:
+    HAS_ANTHROPIC = False
+
+try:
     import openpyxl
     HAS_OPENPYXL = True
 except ImportError:
     HAS_OPENPYXL = False
+
+DEFAULT_EVAL_MODEL = "claude-opus-4-6"
 
 
 # ── evaluate（并发评估） ────────────────────────────────────────────────────────
@@ -56,8 +64,8 @@ PM 备注（必须完全解决其中所有问题，才算 resolved=True）：
 """
 
 
-async def _run_one_case(semaphore: asyncio.Semaphore, skill_text: str, case: dict, idx: int, total: int) -> dict:
-    """在 semaphore 控制下，用 claude -p 跑单条 case 的 pipeline 评估。"""
+async def _run_one_case(semaphore: asyncio.Semaphore, skill_text: str, case: dict, idx: int, total: int, model: str) -> dict:
+    """在 semaphore 控制下，直接调用 Anthropic API 评估单条 case。"""
     async with semaphore:
         prompt = EVAL_PROMPT_TEMPLATE.format(
             skill_text=skill_text,
@@ -68,21 +76,17 @@ async def _run_one_case(semaphore: asyncio.Semaphore, skill_text: str, case: dic
         )
 
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "claude", "-p", prompt,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+            client = anthropic.AsyncAnthropic()
+            message = await client.messages.create(
+                model=model,
+                max_tokens=1024,
+                messages=[{"role": "user", "content": prompt}],
             )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=180)
-            raw = stdout.decode("utf-8", errors="replace").strip()
-        except asyncio.TimeoutError:
-            print(f"  [{idx+1}/{total}] row={case.get('row','?')} TIMEOUT", file=sys.stderr)
-            return {**case, "resolved": False, "output_summary": "", "reason": "评估超时"}
+            raw = message.content[0].text.strip()
         except Exception as e:
             print(f"  [{idx+1}/{total}] row={case.get('row','?')} ERROR: {e}", file=sys.stderr)
             return {**case, "resolved": False, "output_summary": "", "reason": f"执行错误: {e}"}
 
-        # 从输出中提取 JSON（claude 可能会附带解释文字）
         result_json = _extract_json(raw)
         resolved = bool(result_json.get("resolved", False)) if result_json else False
         mark = "✓" if resolved else "✗"
@@ -114,10 +118,10 @@ def _extract_json(text: str) -> dict | None:
     return None
 
 
-async def _evaluate_all(cases: list, skill_text: str, batch: int) -> list:
+async def _evaluate_all(cases: list, skill_text: str, batch: int, model: str) -> list:
     semaphore = asyncio.Semaphore(batch)
     tasks = [
-        _run_one_case(semaphore, skill_text, case, idx, len(cases))
+        _run_one_case(semaphore, skill_text, case, idx, len(cases), model)
         for idx, case in enumerate(cases)
     ]
     return await asyncio.gather(*tasks)
@@ -125,9 +129,12 @@ async def _evaluate_all(cases: list, skill_text: str, batch: int) -> list:
 
 def cmd_evaluate(args: argparse.Namespace) -> None:
     """
-    并发跑全部 bad cases，输出评估结果 JSON 和汇总分数。
-    每个 case 独立启动 `claude -p` 子进程，semaphore 控制并发量。
+    并发调用 LLM API 跑全部 bad cases，输出评估结果 JSON 和汇总分数。
+    使用 asyncio.Semaphore 控制并发量，直接调用 Anthropic API。
     """
+    if not HAS_ANTHROPIC:
+        print(json.dumps({"error": "需要 anthropic SDK: pip install anthropic"}))
+        sys.exit(1)
     # 加载 cases
     cases_path = Path(args.cases)
     if not cases_path.exists():
@@ -151,9 +158,10 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
         print(f"警告：在 {skill_path} 下找不到 SKILL.md，将使用目录名作为 skill 标识", file=sys.stderr)
         skill_text = f"Skill: {skill_path.name}"
 
-    print(f"开始评估：{len(cases)} 条 bad cases，并发 batch={args.batch}", file=sys.stderr)
+    model = getattr(args, "model", DEFAULT_EVAL_MODEL)
+    print(f"开始评估：{len(cases)} 条 bad cases，并发 batch={args.batch}，模型={model}", file=sys.stderr)
 
-    results = asyncio.run(_evaluate_all(cases, skill_text, args.batch))
+    results = asyncio.run(_evaluate_all(cases, skill_text, args.batch, model))
 
     resolved_count = sum(1 for r in results if r.get("resolved"))
     score = resolved_count / len(results) * 10
@@ -356,10 +364,11 @@ def main() -> None:
     p.add_argument("--max", type=int, default=15, help="最多返回几条（默认 15）")
 
     # evaluate
-    p = sub.add_parser("evaluate", help="并发跑 bad cases，输出 eval_results.json 和得分")
+    p = sub.add_parser("evaluate", help="并发调用 LLM API 跑 bad cases，输出 eval_results.json 和得分")
     p.add_argument("--cases", required=True, help="bad_cases.json 路径（load-cases 的输出）")
     p.add_argument("--skill-path", required=True, help="目标 skill 目录路径（含 SKILL.md）")
     p.add_argument("--batch", type=int, default=10, help="并发量（默认 10）")
+    p.add_argument("--model", default=DEFAULT_EVAL_MODEL, help=f"评估用的模型（默认 {DEFAULT_EVAL_MODEL}）")
     p.add_argument("--output", default="eval_results.json", help="结果输出路径（默认 eval_results.json）")
 
     # commit
