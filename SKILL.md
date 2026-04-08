@@ -99,7 +99,7 @@ python ~/.claude/skills/algo-eval-loop/scripts/skill_loop.py load-cases \
 
 **3. 建立基线（Round 0）**
 
-用脚本并发跑全部 bad cases（batch=10，并发调用 LLM API）：
+用脚本并发跑全部 bad cases（batch=10，并发调用 Agent API）：
 
 ```bash
 # 先把 bad cases 保存到文件
@@ -197,7 +197,7 @@ python skill_loop.py evaluate \
 # stdout: {"score": X.X, "resolved": N, "total": M}
 ```
 
-> 原理：并发调用 LLM API（`asyncio.Semaphore(10)` 控制并发量），
+> 原理：并发调用 Agent API（`asyncio.Semaphore(10)` 控制并发量），
 > 每条 case 独立调用一次模型做语义判断，全部完成后汇总分数。
 > 详细结果（含每条 reason）保存在 `eval_results.json`。
 
