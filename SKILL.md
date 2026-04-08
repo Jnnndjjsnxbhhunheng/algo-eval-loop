@@ -172,11 +172,23 @@ python skill_loop.py log --tsv results.tsv --round 0 --score <score> --decision 
 
 **唯一例外**：如果 skill 中存在某类参考数据表，且覆盖面不足是系统性问题，可以批量扩充——但必须一次性大量补充，而非只补 bad cases 涉及的少数条目。
 
-#### Step 3：Commit
+#### Step 3：Commit（必须通过 overfit 自检才能提交）
 
 ```bash
-python skill_loop.py commit <skill目录> -m "skill-iter N: <改动描述>"
+python skill_loop.py commit <skill目录> \
+  --change-type <类型> \
+  --generalizes <yes|no> \
+  -m "skill-iter N: <改动描述>"
 ```
+
+`--change-type` 只允许三个值，填其他值（如 `data`、`example`）命令直接报错退出：
+- `prompt_instruction`：改了模型的 prompt 或判断指令
+- `logic`：改了处理逻辑、流程分支
+- `checkpoint`：改了验证步骤或检查点
+
+`--generalizes` 必须填 `yes`——把 bad cases 的输入换成从未见过的新输入，修改仍然有效吗？填 `no` 同样报错退出。
+
+**如果无法填 `yes`，说明这是特解，回到 Step 1 重新分析根因。**
 
 #### Step 4：评估（脚本并发跑，batch=10，不在这里改 skill）
 
