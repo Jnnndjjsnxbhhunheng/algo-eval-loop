@@ -371,6 +371,47 @@ def cmd_log(args: argparse.Namespace) -> None:
 
     print(f"logged: round={args.round} score={args.score} decision={args.decision}")
 
+    # ── 平台期检测 ────────────────────────────────────────────────────────────
+    _check_plateau(tsv_path)
+
+
+PLATEAU_THRESHOLD = 3  # 连续追平轮次触发警告
+
+
+def _check_plateau(tsv_path: Path) -> None:
+    """检测连续追平 best 未超越的轮次，达到阈值时打印警告。"""
+    try:
+        with open(tsv_path, encoding="utf-8") as f:
+            rows = list(csv.DictReader(f, delimiter="\t"))
+    except Exception:
+        return
+
+    # 只看非基线轮次
+    data_rows = [r for r in rows if r.get("round", "0") != "0"]
+    if not data_rows:
+        return
+
+    best_score = max(float(r["score"]) for r in data_rows)
+
+    # 从最新轮往前数，统计连续"追平但未超越"（revert 且 score == best）
+    consecutive = 0
+    for row in reversed(data_rows):
+        score = float(row["score"])
+        decision = row.get("decision", "")
+        if score == best_score and decision == "revert":
+            consecutive += 1
+        else:
+            break
+
+    if consecutive >= PLATEAU_THRESHOLD:
+        print(
+            f"\n⚠️  平台期警告：已连续 {consecutive} 轮追平 best（{best_score}），未超越。\n"
+            "   局部微调已到收益天花板，建议升级到结构级改动：\n"
+            "   重组处理步骤、调整数据流、增删中间环节。\n"
+            "   （仍须满足简洁性原则和 overfit 约束）",
+            file=sys.stderr,
+        )
+
 
 # ── 主入口 ────────────────────────────────────────────────────────────────────
 
