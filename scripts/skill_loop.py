@@ -393,19 +393,17 @@ def _check_plateau(tsv_path: Path) -> None:
 
     best_score = max(float(r["score"]) for r in data_rows)
 
-    # 从最新轮往前数，统计连续"追平但未超越"（revert 且 score == best）
+    # 从最新轮往前数，统计连续未能超越 best 的轮次（revert）
     consecutive = 0
     for row in reversed(data_rows):
-        score = float(row["score"])
-        decision = row.get("decision", "")
-        if score == best_score and decision == "revert":
+        if row.get("decision", "") == "revert":
             consecutive += 1
         else:
             break
 
     if consecutive >= PLATEAU_THRESHOLD:
         print(
-            f"\n⚠️  平台期警告：已连续 {consecutive} 轮追平 best（{best_score}），未超越。\n"
+            f"\n⚠️  平台期警告：已连续 {consecutive} 轮未超越 best（{best_score}）。\n"
             "   局部微调已到收益天花板，建议升级到结构级改动：\n"
             "   重组处理步骤、调整数据流、增删中间环节。\n"
             "   （仍须满足简洁性原则和 overfit 约束）",
